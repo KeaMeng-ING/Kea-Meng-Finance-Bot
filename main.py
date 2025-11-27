@@ -147,6 +147,30 @@ class DatabaseManager:
             DatabaseManager.release_connection(conn)
     
     @staticmethod
+    def check_segment_reset(user_id):
+        """Check if we're at a new segment and return True if budget should be reminded"""
+        conn = DatabaseManager.get_connection()
+        try:
+            with conn.cursor(cursor_factory=RealDictCursor) as cur:
+                cur.execute("SELECT updated_at FROM budgets WHERE user_id = %s", (user_id,))
+                result = cur.fetchone()
+                
+                if not result:
+                    return False
+                
+                last_update = result['updated_at'].date()
+                today = datetime.now().date()
+                
+                # Check if we crossed a segment boundary
+                today_segment = BudgetCalculator.get_segment_info(today)['segment']
+                last_segment = BudgetCalculator.get_segment_info(last_update)['segment']
+                
+                # Different segment means new period started
+                return today_segment != last_segment or today.month != last_update.month
+        finally:
+            DatabaseManager.release_connection(conn)
+    
+    @staticmethod
     def get_budget(user_id):
         """Get user's budget"""
         conn = DatabaseManager.get_connection()
@@ -442,6 +466,9 @@ async def segment_summary(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user = update.effective_user
     db_user = DatabaseManager.get_or_create_user(user.id, user.username, user.first_name)
     
+    # Check if we're in a new segment
+    is_new_segment = DatabaseManager.check_segment_reset(db_user['id'])
+    
     segment = BudgetCalculator.calculate_segment_summary(db_user['id'])
     
     if not segment:
@@ -459,7 +486,13 @@ async def segment_summary(update: Update, context: ContextTypes.DEFAULT_TYPE):
     expected_spent = segment['target_daily'] * segment['days_passed']
     spending_diff = segment['spent_segment'] - expected_spent
     
+    # Show new segment notification if applicable
+    new_segment_msg = ""
+    if is_new_segment and segment['days_passed'] <= 2:
+        new_segment_msg = f"🎉 NEW SEGMENT STARTED! (Days {segment['start_date'].day}-{segment['end_date'].day})\n\n"
+    
     message = (
+        f"{new_segment_msg}"
         f"📈 Segment {segment['segment']} Summary (Days {segment['start_date'].day}-{segment['end_date'].day})\n\n"
         f"📅 Days Passed: {segment['days_passed']}/{segment['days_in_segment']}\n"
         f"⏳ Days Remaining: {segment['days_remaining']}\n\n"
@@ -561,11 +594,26 @@ async def send_daily_notification(context: ContextTypes.DEFAULT_TYPE):
                     daily = BudgetCalculator.calculate_daily_summary(user['id'])
                     
                     if daily:
-                        message = (
-                            f"🌅 Good morning!\n\n"
-                            f"💰 Today's Budget: ${daily['budget_per_day']:.2f}\n"
-                            f"📅 Date: {daily['date'].strftime('%Y-%m-%d')}"
-                        )
+                        today = datetime.now().date()
+                        segment_info = BudgetCalculator.get_segment_info(today)
+                        
+                        # Check if it's the first day of a new segment
+                        is_segment_start = today.day in [1, 11, 21]
+                        
+                        if is_segment_start:
+                            message = (
+                                f"🎉 NEW SEGMENT STARTED!\n\n"
+                                f"📅 Segment {segment_info['segment']} (Days {segment_info['start_date'].day}-{segment_info['end_date'].day})\n"
+                                f"💰 Daily Budget: ${daily['budget_per_day']:.2f}\n"
+                                f"📆 Date: {daily['date'].strftime('%Y-%m-%d')}\n\n"
+                                f"💡 Remember to set your budget with /setbudget if needed!"
+                            )
+                        else:
+                            message = (
+                                f"🌅 Good morning!\n\n"
+                                f"💰 Today's Budget: ${daily['budget_per_day']:.2f}\n"
+                                f"📅 Date: {daily['date'].strftime('%Y-%m-%d')}"
+                            )
                         
                         await context.bot.send_message(
                             chat_id=user['telegram_id'],
