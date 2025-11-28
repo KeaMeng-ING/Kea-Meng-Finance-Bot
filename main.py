@@ -4,6 +4,7 @@ from datetime import datetime, timedelta
 from decimal import Decimal
 import asyncio
 from dotenv import load_dotenv
+from threading import Thread
 
 load_dotenv()
 
@@ -19,6 +20,9 @@ from telegram.ext import (
 import psycopg2
 from psycopg2.extras import RealDictCursor
 from psycopg2.pool import SimpleConnectionPool
+
+# Flask for health check endpoint (required by Render)
+from flask import Flask
 
 # Configure logging
 logging.basicConfig(
@@ -41,6 +45,17 @@ db_pool = SimpleConnectionPool(1, 10, **DB_CONFIG)
 
 # Telegram Bot Token
 BOT_TOKEN = os.getenv('TELEGRAM_BOT_TOKEN', 'YOUR_BOT_TOKEN_HERE')
+
+# Flask app for health check
+flask_app = Flask(__name__)
+
+@flask_app.route('/')
+def health_check():
+    return {'status': 'ok', 'bot': 'running'}, 200
+
+@flask_app.route('/health')
+def health():
+    return {'status': 'healthy'}, 200
 
 
 class DatabaseManager:
@@ -625,10 +640,21 @@ async def send_daily_notification(context: ContextTypes.DEFAULT_TYPE):
         DatabaseManager.release_connection(conn)
 
 
+def run_flask():
+    """Run Flask server in a separate thread"""
+    port = int(os.getenv('PORT', 10000))
+    flask_app.run(host='0.0.0.0', port=port, debug=False, use_reloader=False)
+
+
 def main():
     """Start the bot"""
     # Initialize database
     DatabaseManager.init_database()
+    
+    # Start Flask server in a separate thread (for Render health checks)
+    flask_thread = Thread(target=run_flask, daemon=True)
+    flask_thread.start()
+    logger.info(f"Flask health check server started on port {os.getenv('PORT', 10000)}")
     
     # Create application
     application = Application.builder().token(BOT_TOKEN).build()
