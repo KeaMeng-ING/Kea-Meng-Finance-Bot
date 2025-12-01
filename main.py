@@ -497,10 +497,6 @@ async def segment_summary(update: Update, context: ContextTypes.DEFAULT_TYPE):
     
     status = "✅" if segment['remaining_segment'] >= 0 else "⚠️"
     
-    # Calculate expected spending vs actual
-    expected_spent = segment['target_daily'] * segment['days_passed']
-    spending_diff = segment['spent_segment'] - expected_spent
-    
     # Show new segment notification if applicable
     new_segment_msg = ""
     if is_new_segment and segment['days_passed'] <= 2:
@@ -527,12 +523,20 @@ async def segment_summary(update: Update, context: ContextTypes.DEFAULT_TYPE):
         else:
             message += f"🚨 You're over budget by ${abs(daily['remaining_today']):.2f} today!"
     
-    # Calculate adjusted budget for future days if overspent
+    # Calculate adjusted budget for FUTURE days (excluding today)
     days_left_after_today = segment['days_remaining'] - 1
     if days_left_after_today > 0:
-        # Calculate what's left for future days (excluding today)
-        future_budget = segment['remaining_segment'] - daily['remaining_today'] if daily else segment['remaining_segment']
-        adjusted_daily = future_budget / days_left_after_today
+        # Budget allocated for future days (days_left_after_today × daily_budget)
+        future_budget_allocation = segment['target_daily'] * days_left_after_today
+        
+        # Add unused budget from today
+        unused_today = daily['remaining_today'] if daily and daily['remaining_today'] > 0 else Decimal(0)
+        
+        # Total available for future days
+        total_future_budget = future_budget_allocation + unused_today
+        
+        # Calculate adjusted daily for future days
+        adjusted_daily = total_future_budget / days_left_after_today
         
         if adjusted_daily != segment['target_daily']:
             message += f"\n\n💡 Adjusted budget for remaining {days_left_after_today} days: ${adjusted_daily:.2f}/day"
@@ -546,12 +550,7 @@ async def segment_summary(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if segment['remaining_segment'] < 0:
         message += f"\n\n🚨 SEGMENT BUDGET EXCEEDED by ${abs(segment['remaining_segment']):.2f}!"
     
-    # Show adjusted daily recommendation only if overspent
-    if segment['suggested_daily'] < segment['target_daily'] and segment['remaining_segment'] > 0:
-        message += f"\n💡 Recommended: ${segment['suggested_daily']:.2f}/day for remaining days"
-    
     await update.message.reply_text(message)
-
 
 async def view_expenses(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Handle /expenses command"""
