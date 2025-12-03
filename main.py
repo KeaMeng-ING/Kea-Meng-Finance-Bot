@@ -22,7 +22,7 @@ from psycopg2.extras import RealDictCursor
 from psycopg2.pool import SimpleConnectionPool
 
 # Flask for health check endpoint (required by Render)
-from flask import Flask
+from flask import Flask, jsonify
 
 # Configure logging
 logging.basicConfig(
@@ -56,6 +56,76 @@ def health_check():
 @flask_app.route('/health')
 def health():
     return {'status': 'healthy'}, 200
+
+@flask_app.route('/ping')
+def ping_database():
+    """Endpoint to ping database and keep it active"""
+    try:
+        conn = DatabaseManager.get_connection()
+        try:
+            with conn.cursor() as cur:
+                # Simple query to keep database active
+                cur.execute("SELECT 1")
+                cur.fetchone()
+                
+                # Get some stats
+                cur.execute("SELECT COUNT(*) FROM users")
+                user_count = cur.fetchone()[0]
+                
+            logger.info("Database ping successful")
+            return jsonify({
+                'status': 'ok',
+                'database': 'active',
+                'timestamp': datetime.now().isoformat(),
+                'users': user_count
+            }), 200
+        finally:
+            DatabaseManager.release_connection(conn)
+    except Exception as e:
+        logger.error(f"Database ping failed: {e}")
+        return jsonify({
+            'status': 'error',
+            'database': 'inactive',
+            'error': str(e),
+            'timestamp': datetime.now().isoformat()
+        }), 500
+
+@flask_app.route('/status')
+def status():
+    """Combined status endpoint for both bot and database"""
+    try:
+        # Check database
+        conn = DatabaseManager.get_connection()
+        try:
+            with conn.cursor() as cur:
+                cur.execute("SELECT COUNT(*) FROM users")
+                user_count = cur.fetchone()[0]
+                cur.execute("SELECT COUNT(*) FROM expenses")
+                expense_count = cur.fetchone()[0]
+            db_status = 'active'
+        except Exception as e:
+            db_status = f'error: {str(e)}'
+            user_count = 0
+            expense_count = 0
+        finally:
+            DatabaseManager.release_connection(conn)
+        
+        return jsonify({
+            'bot': 'running',
+            'database': db_status,
+            'stats': {
+                'users': user_count,
+                'expenses': expense_count
+            },
+            'timestamp': datetime.now().isoformat()
+        }), 200
+    except Exception as e:
+        return jsonify({
+            'bot': 'running',
+            'database': 'error',
+            'error': str(e),
+            'timestamp': datetime.now().isoformat()
+        }), 500
 
 
 class DatabaseManager:
@@ -523,23 +593,17 @@ async def segment_summary(update: Update, context: ContextTypes.DEFAULT_TYPE):
         else:
             message += f"🚨 You're over budget by ${abs(daily['remaining_today']):.2f} today!"
     
-    # Calculate adjusted budget for FUTURE days (excluding today)
-    days_left_after_today = segment['days_remaining'] - 1
-    if days_left_after_today > 0:
-        # Budget allocated for future days (days_left_after_today × daily_budget)
-        future_budget_allocation = segment['target_daily'] * days_left_after_today
+    # Calculate adjusted budget for remaining days (including today)
+    days_remaining_including_today = segment['days_remaining']
+    if days_remaining_including_today > 0:
+        # Total remaining budget in the segment (what's left to spend)
+        total_remaining_budget = segment['remaining_segment']
         
-        # Add unused budget from today
-        unused_today = daily['remaining_today'] if daily and daily['remaining_today'] > 0 else Decimal(0)
-        
-        # Total available for future days
-        total_future_budget = future_budget_allocation + unused_today
-        
-        # Calculate adjusted daily for future days
-        adjusted_daily = total_future_budget / days_left_after_today
+        # Calculate adjusted daily for all remaining days (including today)
+        adjusted_daily = total_remaining_budget / days_remaining_including_today
         
         if adjusted_daily != segment['target_daily']:
-            message += f"\n\n💡 Adjusted budget for remaining {days_left_after_today} days: ${adjusted_daily:.2f}/day"
+            message += f"\n\n💡 Adjusted budget for remaining {days_remaining_including_today} days: ${adjusted_daily:.2f}/day"
             
             if adjusted_daily < segment['target_daily']:
                 message += f"\n⚠️ Reduced by ${segment['target_daily'] - adjusted_daily:.2f}/day due to overspending"
