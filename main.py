@@ -5,6 +5,7 @@ from decimal import Decimal
 import asyncio
 from dotenv import load_dotenv
 from threading import Thread
+import pytz
 
 load_dotenv()
 
@@ -30,6 +31,17 @@ logging.basicConfig(
     level=logging.INFO
 )
 logger = logging.getLogger(__name__)
+
+# Timezone configuration
+TIMEZONE = pytz.timezone('Asia/Bangkok')  # GMT+7
+
+def get_current_time():
+    """Get current time in GMT+7"""
+    return datetime.now(TIMEZONE)
+
+def get_current_date():
+    """Get current date in GMT+7"""
+    return get_current_time().date()
 
 # Database configuration
 DB_CONFIG = {
@@ -76,7 +88,7 @@ def ping_database():
             return jsonify({
                 'status': 'ok',
                 'database': 'active',
-                'timestamp': datetime.now().isoformat(),
+                'timestamp': get_current_time().isoformat(),
                 'users': user_count
             }), 200
         finally:
@@ -87,7 +99,7 @@ def ping_database():
             'status': 'error',
             'database': 'inactive',
             'error': str(e),
-            'timestamp': datetime.now().isoformat()
+            'timestamp': get_current_time().isoformat()
         }), 500
 
 @flask_app.route('/status')
@@ -117,14 +129,14 @@ def status():
                 'users': user_count,
                 'expenses': expense_count
             },
-            'timestamp': datetime.now().isoformat()
+            'timestamp': get_current_time().isoformat()
         }), 200
     except Exception as e:
         return jsonify({
             'bot': 'running',
             'database': 'error',
             'error': str(e),
-            'timestamp': datetime.now().isoformat()
+            'timestamp': get_current_time().isoformat()
         }), 500
 
 
@@ -156,16 +168,35 @@ class DatabaseManager:
                     )
                 """)
                 
-                # Create Budget table
+                # Create Budget table - added adjusted_daily field
                 cur.execute("""
                     CREATE TABLE IF NOT EXISTS budgets (
                         id SERIAL PRIMARY KEY,
                         user_id INTEGER REFERENCES users(id) ON DELETE CASCADE,
                         budget_per_day DECIMAL(10, 2) NOT NULL,
                         base_amount DECIMAL(10, 2) NOT NULL,
+                        adjusted_daily DECIMAL(10, 2),
+                        last_adjustment_date DATE,
                         updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
                         UNIQUE(user_id)
                     )
+                """)
+                
+                # Add columns if they don't exist (for existing databases)
+                cur.execute("""
+                    DO $$ 
+                    BEGIN 
+                        BEGIN
+                            ALTER TABLE budgets ADD COLUMN adjusted_daily DECIMAL(10, 2);
+                        EXCEPTION
+                            WHEN duplicate_column THEN NULL;
+                        END;
+                        BEGIN
+                            ALTER TABLE budgets ADD COLUMN last_adjustment_date DATE;
+                        EXCEPTION
+                            WHEN duplicate_column THEN NULL;
+                        END;
+                    END $$;
                 """)
                 
                 # Create Expenses table
@@ -221,11 +252,28 @@ class DatabaseManager:
         try:
             with conn.cursor() as cur:
                 cur.execute(
-                    """INSERT INTO budgets (user_id, budget_per_day, base_amount, updated_at)
-                       VALUES (%s, %s, %s, CURRENT_TIMESTAMP)
+                    """INSERT INTO budgets (user_id, budget_per_day, base_amount, adjusted_daily, last_adjustment_date, updated_at)
+                       VALUES (%s, %s, %s, %s, %s, CURRENT_TIMESTAMP)
                        ON CONFLICT (user_id) 
                        DO UPDATE SET budget_per_day = %s, base_amount = %s, updated_at = CURRENT_TIMESTAMP""",
-                    (user_id, budget_per_day, base_amount, budget_per_day, base_amount)
+                    (user_id, budget_per_day, base_amount, budget_per_day, get_current_date(), 
+                     budget_per_day, base_amount)
+                )
+                conn.commit()
+        finally:
+            DatabaseManager.release_connection(conn)
+    
+    @staticmethod
+    def update_adjusted_daily(user_id, adjusted_daily, adjustment_date):
+        """Update the adjusted daily budget"""
+        conn = DatabaseManager.get_connection()
+        try:
+            with conn.cursor() as cur:
+                cur.execute(
+                    """UPDATE budgets 
+                       SET adjusted_daily = %s, last_adjustment_date = %s
+                       WHERE user_id = %s""",
+                    (adjusted_daily, adjustment_date, user_id)
                 )
                 conn.commit()
         finally:
@@ -244,7 +292,7 @@ class DatabaseManager:
                     return False
                 
                 last_update = result['updated_at'].date()
-                today = datetime.now().date()
+                today = get_current_date()
                 
                 # Check if we crossed a segment boundary
                 today_segment = BudgetCalculator.get_segment_info(today)['segment']
@@ -355,18 +403,25 @@ class BudgetCalculator:
     @staticmethod
     def calculate_daily_summary(user_id):
         """Calculate daily spending summary"""
-        today = datetime.now().date()
+        today = get_current_date()
         
         budget = DatabaseManager.get_budget(user_id)
         if not budget:
             return None
         
         total_spent_today = DatabaseManager.get_total_spent(user_id, today, today)
-        remaining_today = Decimal(budget['budget_per_day']) - total_spent_today
+        
+        # Use adjusted_daily if available and set today, otherwise use base budget_per_day
+        current_daily_budget = budget['budget_per_day']
+        if budget.get('adjusted_daily') and budget.get('last_adjustment_date') == today:
+            current_daily_budget = budget['adjusted_daily']
+        
+        remaining_today = Decimal(current_daily_budget) - total_spent_today
         
         return {
             'date': today,
             'budget_per_day': budget['budget_per_day'],
+            'current_daily_budget': current_daily_budget,
             'spent_today': total_spent_today,
             'remaining_today': remaining_today
         }
@@ -374,7 +429,7 @@ class BudgetCalculator:
     @staticmethod
     def calculate_segment_summary(user_id):
         """Calculate 10-day segment summary"""
-        today = datetime.now().date()
+        today = get_current_date()
         segment_info = BudgetCalculator.get_segment_info(today)
         
         budget = DatabaseManager.get_budget(user_id)
@@ -391,11 +446,17 @@ class BudgetCalculator:
         )
         remaining_segment = segment_budget - total_spent_segment
         
-        # Calculate suggested daily based on remaining budget and remaining days
-        suggested_daily = remaining_segment / segment_info['days_remaining'] if segment_info['days_remaining'] > 0 else Decimal(0)
+        # Calculate suggested daily for TOMORROW onwards (remaining days - 1 for today)
+        days_remaining_from_tomorrow = segment_info['days_remaining'] - 1
+        suggested_daily = remaining_segment / days_remaining_from_tomorrow if days_remaining_from_tomorrow > 0 else Decimal(0)
         
         # Also show target daily (what they should be spending ideally)
         target_daily = Decimal(budget['budget_per_day'])
+        
+        # Get current daily budget (adjusted or base)
+        current_daily_budget = budget['budget_per_day']
+        if budget.get('adjusted_daily') and budget.get('last_adjustment_date') == today:
+            current_daily_budget = budget['adjusted_daily']
         
         return {
             **segment_info,
@@ -403,7 +464,9 @@ class BudgetCalculator:
             'spent_segment': total_spent_segment,
             'remaining_segment': remaining_segment,
             'suggested_daily': suggested_daily,
-            'target_daily': target_daily
+            'target_daily': target_daily,
+            'current_daily_budget': current_daily_budget,
+            'days_remaining_from_tomorrow': days_remaining_from_tomorrow
         }
 
 
@@ -490,7 +553,7 @@ async def add_expense_command(update: Update, context: ContextTypes.DEFAULT_TYPE
         amount = Decimal(context.args[0])
         description = ' '.join(context.args[1:]) if len(context.args) > 1 else ""
         
-        today = datetime.now().date()
+        today = get_current_date()
         DatabaseManager.add_expense(db_user['id'], amount, today, description)
         
         daily = BudgetCalculator.calculate_daily_summary(db_user['id'])
@@ -502,11 +565,11 @@ async def add_expense_command(update: Update, context: ContextTypes.DEFAULT_TYPE
         if daily:
             if daily['remaining_today'] >= 0:
                 message += f"\n\n💰 Remaining today: ${daily['remaining_today']:.2f}"
-                if daily['remaining_today'] < daily['budget_per_day'] * Decimal('0.2'):
+                if daily['remaining_today'] < daily['current_daily_budget'] * Decimal('0.2'):
                     message += "\n⚠️ Getting close to your daily limit!"
             else:
                 message += f"\n\n🚨 OVER BUDGET by ${abs(daily['remaining_today']):.2f}!"
-                message += f"\n💰 Daily Limit: ${daily['budget_per_day']:.2f}"
+                message += f"\n💰 Daily Limit: ${daily['current_daily_budget']:.2f}"
         
         await update.message.reply_text(message)
     except (ValueError, IndexError):
@@ -533,17 +596,19 @@ async def today_summary(update: Update, context: ContextTypes.DEFAULT_TYPE):
     
     message = (
         f"📊 Daily Summary - {daily['date'].strftime('%Y-%m-%d')}\n\n"
-        f"💵 Daily Budget: ${daily['budget_per_day']:.2f}\n"
+        f"💵 Today's Budget: ${daily['current_daily_budget']:.2f}\n"
         f"💸 Spent Today: ${daily['spent_today']:.2f}\n"
         f"{status} Remaining: ${daily['remaining_today']:.2f}"
     )
     
     if daily['remaining_today'] < 0:
         message += f"\n\n🚨 OVER BUDGET by ${abs(daily['remaining_today']):.2f}!"
-    elif daily['remaining_today'] < daily['budget_per_day'] * Decimal('0.2'):
+    elif daily['remaining_today'] < daily['current_daily_budget'] * Decimal('0.2'):
         message += "\n\n⚠️ Less than 20% remaining today!"
     
     await update.message.reply_text(message)
+
+
 
 
 async def segment_summary(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -580,35 +645,44 @@ async def segment_summary(update: Update, context: ContextTypes.DEFAULT_TYPE):
         f"💰 Segment Budget: ${segment['segment_budget']:.2f}\n"
         f"💸 Spent So Far: ${segment['spent_segment']:.2f}\n"
         f"{status} Remaining: ${segment['remaining_segment']:.2f}\n\n"
-        f"🎯 Daily Budget: ${segment['target_daily']:.2f}/day\n"
     )
     
-    # Add today's spending and remaining budget
+    # TODAY section
+    message += f"📅 TODAY (Day {segment['days_passed']}):\n"
     if daily:
-        message += f"💸 Spent today: ${daily['spent_today']:.2f}\n"
+        message += f"💵 Budget: ${segment['current_daily_budget']:.2f}\n"
+        message += f"💸 Spent: ${daily['spent_today']:.2f}\n"
         if daily['remaining_today'] > 0:
-            message += f"💵 You have ${daily['remaining_today']:.2f} left to spend for today"
+            message += f"✅ Left: ${daily['remaining_today']:.2f}"
         elif daily['remaining_today'] == 0:
-            message += f"✅ You have $0 left to spend for today"
+            message += f"✅ Used all budget"
         else:
-            message += f"🚨 You're over budget by ${abs(daily['remaining_today']):.2f} today!"
+            message += f"🚨 Over by: ${abs(daily['remaining_today']):.2f}"
     
-    # Calculate adjusted budget for remaining days (including today)
-    days_remaining_including_today = segment['days_remaining']
-    if days_remaining_including_today > 0:
-        # Total remaining budget in the segment (what's left to spend)
-        total_remaining_budget = segment['remaining_segment']
+    # TOMORROW ONWARDS section
+    if segment['days_remaining_from_tomorrow'] > 0:
+        message += f"\n\n📅 TOMORROW ONWARDS ({segment['days_remaining_from_tomorrow']} days):\n"
+        message += f"💡 Budget per day: ${segment['suggested_daily']:.2f}\n"
         
-        # Calculate adjusted daily for all remaining days (including today)
-        adjusted_daily = total_remaining_budget / days_remaining_including_today
-        
-        if adjusted_daily != segment['target_daily']:
-            message += f"\n\n💡 Adjusted budget for remaining {days_remaining_including_today} days: ${adjusted_daily:.2f}/day"
+        if segment['suggested_daily'] < segment['target_daily']:
+            # Calculate what you SHOULD have for tomorrow onwards
+            expected_for_tomorrow = segment['target_daily'] * segment['days_remaining_from_tomorrow']
             
-            if adjusted_daily < segment['target_daily']:
-                message += f"\n⚠️ Reduced by ${segment['target_daily'] - adjusted_daily:.2f}/day due to overspending"
-            else:
-                message += f"\n✅ You can spend ${adjusted_daily - segment['target_daily']:.2f}/day more!"
+            # What you'll ACTUALLY have
+            actual_remaining = segment['remaining_segment']
+            
+            # Deficit
+            deficit = expected_for_tomorrow - actual_remaining
+            
+            # Amount reduced per day
+            reduction_per_day = segment['target_daily'] - segment['suggested_daily']
+            
+            message += f"⚠️ ${reduction_per_day:.2f}/day less\n"
+            if deficit > 0:
+                message += f"💰 Need to save ${deficit:.2f} total to get back on track"
+        elif segment['suggested_daily'] > segment['target_daily']:
+            surplus = segment['suggested_daily'] - segment['target_daily']
+            message += f"✅ ${surplus:.2f}/day extra!"
     
     # Warn if segment budget exceeded
     if segment['remaining_segment'] < 0:
@@ -616,12 +690,13 @@ async def segment_summary(update: Update, context: ContextTypes.DEFAULT_TYPE):
     
     await update.message.reply_text(message)
 
+
 async def view_expenses(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Handle /expenses command"""
     user = update.effective_user
     db_user = DatabaseManager.get_or_create_user(user.id, user.username, user.first_name)
     
-    today = datetime.now().date()
+    today = get_current_date()
     start_date = today - timedelta(days=7)
     
     expenses = DatabaseManager.get_expenses(db_user['id'], start_date, today)
@@ -660,19 +735,43 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 async def send_daily_notification(context: ContextTypes.DEFAULT_TYPE):
-    """Send daily notifications to all users"""
+    """Send daily notifications to all users at 9 AM and adjust budgets"""
     conn = DatabaseManager.get_connection()
     try:
         with conn.cursor(cursor_factory=RealDictCursor) as cur:
             cur.execute("SELECT * FROM users")
             users = cur.fetchall()
             
+            today = get_current_date()
+            yesterday = today - timedelta(days=1)
+            
             for user in users:
                 try:
-                    daily = BudgetCalculator.calculate_daily_summary(user['id'])
+                    # Get budget info
+                    budget = DatabaseManager.get_budget(user['id'])
+                    if not budget:
+                        continue
                     
-                    if daily:
-                        today = datetime.now().date()
+                    # Calculate what the adjusted daily should be for today
+                    segment = BudgetCalculator.calculate_segment_summary(user['id'])
+                    if not segment:
+                        continue
+                    
+                    # Get yesterday's spending
+                    spent_yesterday = DatabaseManager.get_total_spent(user['id'], yesterday, yesterday)
+                    
+                    # Determine today's budget based on yesterday's performance
+                    yesterday_budget = budget.get('adjusted_daily') or budget['budget_per_day']
+                    
+                    # If overspent yesterday or underspent yesterday, adjust for today
+                    days_remaining = segment['days_remaining']
+                    if days_remaining > 0:
+                        # Calculate new daily budget based on remaining segment budget
+                        new_daily_budget = segment['remaining_segment'] / days_remaining
+                        
+                        # Update the adjusted daily for today
+                        DatabaseManager.update_adjusted_daily(user['id'], new_daily_budget, today)
+                        
                         segment_info = BudgetCalculator.get_segment_info(today)
                         
                         # Check if it's the first day of a new segment
@@ -682,16 +781,32 @@ async def send_daily_notification(context: ContextTypes.DEFAULT_TYPE):
                             message = (
                                 f"🎉 NEW SEGMENT STARTED!\n\n"
                                 f"📅 Segment {segment_info['segment']} (Days {segment_info['start_date'].day}-{segment_info['end_date'].day})\n"
-                                f"💰 Daily Budget: ${daily['budget_per_day']:.2f}\n"
-                                f"📆 Date: {daily['date'].strftime('%Y-%m-%d')}\n\n"
+                                f"💰 Today's Budget: ${new_daily_budget:.2f}\n"
+                                f"📆 Date: {today.strftime('%Y-%m-%d')}\n\n"
                                 f"💡 Remember to set your budget with /setbudget if needed!"
                             )
                         else:
-                            message = (
-                                f"🌅 Good morning!\n\n"
-                                f"💰 Today's Budget: ${daily['budget_per_day']:.2f}\n"
-                                f"📅 Date: {daily['date'].strftime('%Y-%m-%d')}"
-                            )
+                            # Show budget adjustment info
+                            if new_daily_budget < Decimal(budget['budget_per_day']):
+                                message = (
+                                    f"🌅 Good morning!\n\n"
+                                    f"💰 Today's Budget: ${new_daily_budget:.2f}\n"
+                                    f"⚠️ Adjusted down from ${budget['budget_per_day']:.2f} due to overspending\n"
+                                    f"📅 Date: {today.strftime('%Y-%m-%d')}"
+                                )
+                            elif new_daily_budget > Decimal(budget['budget_per_day']):
+                                message = (
+                                    f"🌅 Good morning!\n\n"
+                                    f"💰 Today's Budget: ${new_daily_budget:.2f}\n"
+                                    f"✅ Adjusted up from ${budget['budget_per_day']:.2f} - you're doing great!\n"
+                                    f"📅 Date: {today.strftime('%Y-%m-%d')}"
+                                )
+                            else:
+                                message = (
+                                    f"🌅 Good morning!\n\n"
+                                    f"💰 Today's Budget: ${new_daily_budget:.2f}\n"
+                                    f"📅 Date: {today.strftime('%Y-%m-%d')}"
+                                )
                         
                         await context.bot.send_message(
                             chat_id=user['telegram_id'],
@@ -707,6 +822,7 @@ def run_flask():
     """Run Flask server in a separate thread"""
     port = int(os.getenv('PORT', 10000))
     flask_app.run(host='0.0.0.0', port=port, debug=False, use_reloader=False)
+
 
 
 def main():
@@ -731,16 +847,19 @@ def main():
     application.add_handler(CommandHandler("expenses", view_expenses))
     application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_text))
     
-    # Schedule daily notifications (9 AM every day)
+    # Schedule daily notifications (9 AM GMT+7 every day)
     job_queue = application.job_queue
+    # Create timezone-aware time object
+    notification_time = datetime.strptime("09:00", "%H:%M").time().replace(tzinfo=TIMEZONE)
     job_queue.run_daily(
         send_daily_notification,
-        time=datetime.strptime("09:00", "%H:%M").time()
+        time=notification_time
     )
     
     # Start bot
     logger.info("Bot starting...")
     application.run_polling(allowed_updates=Update.ALL_TYPES)
+
 
 
 if __name__ == '__main__':
