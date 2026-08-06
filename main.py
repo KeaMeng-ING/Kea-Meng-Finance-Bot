@@ -1,10 +1,11 @@
 import os
 import logging
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, time as dt_time
 from decimal import Decimal
 import asyncio
 from dotenv import load_dotenv
 from threading import Thread
+from zoneinfo import ZoneInfo
 import pytz
 
 load_dotenv()
@@ -34,6 +35,19 @@ logger = logging.getLogger(__name__)
 
 # Timezone configuration
 TIMEZONE = pytz.timezone('Asia/Bangkok')  # GMT+7
+
+# Separate tzinfo for job scheduling. python-telegram-bot dropped pytz in v20 and
+# documents zoneinfo for job times; a pytz zone attached via .replace(tzinfo=...)
+# also reports the 1900-era LMT offset (+06:42) if anything reads it directly.
+SCHEDULE_TZ = ZoneInfo('Asia/Bangkok')
+
+# Weekday clock in/out reminders (local time, Mon-Fri)
+CLOCK_REMINDERS = [
+    (dt_time(7, 30), "⏰ Clock In", "Time to clock in for the morning shift."),
+    (dt_time(11, 50), "🍽️ Clock Out", "Time to clock out for lunch."),
+    (dt_time(13, 0), "⏰ Clock In", "Time to clock in for the afternoon shift."),
+    (dt_time(16, 25), "🏁 Clock Out", "Time to clock out — end of day."),
+]
 
 def get_current_time():
     """Get current time in GMT+7"""
@@ -818,6 +832,32 @@ async def send_daily_notification(context: ContextTypes.DEFAULT_TYPE):
         DatabaseManager.release_connection(conn)
 
 
+async def send_clock_reminder(context: ContextTypes.DEFAULT_TYPE):
+    """Send a clock in/out reminder to all users (weekdays only)"""
+    # Skip weekends. The job is registered for every day and filtered here so the
+    # behaviour does not depend on how the installed PTB version numbers weekdays.
+    if get_current_time().weekday() >= 5:
+        return
+
+    title, body = context.job.data
+    now = get_current_time()
+    message = f"{title}\n\n{body}\n🕐 {now.strftime('%H:%M')} - {now.strftime('%A, %d %b %Y')}"
+
+    conn = DatabaseManager.get_connection()
+    try:
+        with conn.cursor(cursor_factory=RealDictCursor) as cur:
+            cur.execute("SELECT telegram_id FROM users")
+            users = cur.fetchall()
+    finally:
+        DatabaseManager.release_connection(conn)
+
+    for user in users:
+        try:
+            await context.bot.send_message(chat_id=user['telegram_id'], text=message)
+        except Exception as e:
+            logger.error(f"Error sending clock reminder to {user['telegram_id']}: {e}")
+
+
 def run_flask():
     """Run Flask server in a separate thread"""
     port = int(os.getenv('PORT', 10000))
@@ -849,13 +889,21 @@ def main():
     
     # Schedule daily notifications (9 AM GMT+7 every day)
     job_queue = application.job_queue
-    # Create timezone-aware time object
-    notification_time = datetime.strptime("09:00", "%H:%M").time().replace(tzinfo=TIMEZONE)
     job_queue.run_daily(
         send_daily_notification,
-        time=notification_time
+        time=dt_time(9, 0, tzinfo=SCHEDULE_TZ)
     )
-    
+
+    # Schedule weekday clock in/out reminders
+    for reminder_time, title, body in CLOCK_REMINDERS:
+        job_queue.run_daily(
+            send_clock_reminder,
+            time=reminder_time.replace(tzinfo=SCHEDULE_TZ),
+            data=(title, body),
+            name=f"clock_reminder_{reminder_time.strftime('%H%M')}"
+        )
+        logger.info(f"Scheduled {title} reminder at {reminder_time.strftime('%H:%M')} (weekdays)")
+
     # Start bot
     logger.info("Bot starting...")
     application.run_polling(allowed_updates=Update.ALL_TYPES)
