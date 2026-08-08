@@ -21,7 +21,7 @@ from telegram.ext import (
 
 import psycopg2
 from psycopg2.extras import RealDictCursor
-from psycopg2.pool import SimpleConnectionPool
+from psycopg2.pool import ThreadedConnectionPool
 
 # Flask for health check endpoint (required by Render)
 from flask import Flask, jsonify
@@ -49,6 +49,15 @@ CLOCK_REMINDERS = [
     (dt_time(16, 25), "🏁 Clock Out", "Time to clock out — end of day."),
 ]
 
+# How late a missed reminder may still be delivered on startup. A restart at 13:05
+# should still nudge you to clock in; one at 16:00 should not replay the morning.
+CATCH_UP_WINDOW = timedelta(minutes=90)
+
+# APScheduler defaults misfire_grace_time to 1 second and python-telegram-bot does
+# not override it, so a job whose run time slips by more than a second is dropped
+# outright. This keeps a brief stall from costing a reminder.
+REMINDER_MISFIRE_GRACE = 300
+
 def get_current_time():
     """Get current time in GMT+7"""
     return datetime.now(TIMEZONE)
@@ -66,8 +75,10 @@ DB_CONFIG = {
     'port': os.getenv('DB_PORT', '5432')
 }
 
-# Initialize connection pool
-db_pool = SimpleConnectionPool(1, 10, **DB_CONFIG)
+# Initialize connection pool. Must be the threaded variant: the Flask health-check
+# thread and the bot's asyncio loop both borrow from this pool, and psycopg2's
+# SimpleConnectionPool is documented as unsafe to share across threads.
+db_pool = ThreadedConnectionPool(1, 10, **DB_CONFIG)
 
 # Telegram Bot Token
 BOT_TOKEN = os.getenv('TELEGRAM_BOT_TOKEN', 'YOUR_BOT_TOKEN_HERE')
@@ -225,6 +236,19 @@ class DatabaseManager:
                     )
                 """)
                 
+                # Records which clock reminders have gone out, so a scheduled run and
+                # a startup catch-up can never both deliver the same one. The unique
+                # constraint is what makes the claim below atomic.
+                cur.execute("""
+                    CREATE TABLE IF NOT EXISTS clock_reminder_sends (
+                        id SERIAL PRIMARY KEY,
+                        reminder_key VARCHAR(8) NOT NULL,
+                        sent_date DATE NOT NULL,
+                        sent_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                        UNIQUE (reminder_key, sent_date)
+                    )
+                """)
+
                 # Create indexes
                 cur.execute("CREATE INDEX IF NOT EXISTS idx_expenses_user_date ON expenses(user_id, expense_date)")
                 cur.execute("CREATE INDEX IF NOT EXISTS idx_users_telegram ON users(telegram_id)")
@@ -234,6 +258,51 @@ class DatabaseManager:
         finally:
             DatabaseManager.release_connection(conn)
     
+    @staticmethod
+    def claim_clock_reminder(reminder_key, sent_date):
+        """Claim today's slot for a reminder. True means this caller should send it.
+
+        ON CONFLICT DO NOTHING makes the claim atomic, so the scheduled job and the
+        startup catch-up can both attempt a reminder and exactly one will win.
+        """
+        conn = DatabaseManager.get_connection()
+        try:
+            with conn.cursor() as cur:
+                cur.execute(
+                    """INSERT INTO clock_reminder_sends (reminder_key, sent_date)
+                       VALUES (%s, %s)
+                       ON CONFLICT (reminder_key, sent_date) DO NOTHING
+                       RETURNING id""",
+                    (reminder_key, sent_date)
+                )
+                claimed = cur.fetchone() is not None
+                conn.commit()
+                return claimed
+        finally:
+            DatabaseManager.release_connection(conn)
+
+    @staticmethod
+    def get_all_telegram_ids():
+        """Every registered user's telegram_id"""
+        conn = DatabaseManager.get_connection()
+        try:
+            with conn.cursor(cursor_factory=RealDictCursor) as cur:
+                cur.execute("SELECT telegram_id FROM users")
+                return cur.fetchall()
+        finally:
+            DatabaseManager.release_connection(conn)
+
+    @staticmethod
+    def get_all_users():
+        """Every registered user row"""
+        conn = DatabaseManager.get_connection()
+        try:
+            with conn.cursor(cursor_factory=RealDictCursor) as cur:
+                cur.execute("SELECT * FROM users")
+                return cur.fetchall()
+        finally:
+            DatabaseManager.release_connection(conn)
+
     @staticmethod
     def get_or_create_user(telegram_id, username, first_name):
         """Get existing user or create new one"""
@@ -748,88 +817,117 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await view_expenses(update, context)
 
 
+def build_daily_notifications():
+    """Adjust each user's budget and build their morning message.
+
+    Pure blocking database work, split out of the job callback so it can run in a
+    worker thread via asyncio.to_thread. Returns (telegram_id, message) pairs for
+    the caller to send.
+    """
+    users = DatabaseManager.get_all_users()
+    today = get_current_date()
+    outgoing = []
+
+    for user in users:
+        try:
+            # Get budget info
+            budget = DatabaseManager.get_budget(user['id'])
+            if not budget:
+                continue
+
+            # Calculate what the adjusted daily should be for today
+            segment = BudgetCalculator.calculate_segment_summary(user['id'])
+            if not segment:
+                continue
+
+            # If overspent yesterday or underspent yesterday, adjust for today
+            days_remaining = segment['days_remaining']
+            if days_remaining <= 0:
+                continue
+
+            # Calculate new daily budget based on remaining segment budget
+            new_daily_budget = segment['remaining_segment'] / days_remaining
+
+            # Update the adjusted daily for today
+            DatabaseManager.update_adjusted_daily(user['id'], new_daily_budget, today)
+
+            segment_info = BudgetCalculator.get_segment_info(today)
+
+            # Check if it's the first day of a new segment
+            is_segment_start = today.day in [1, 11, 21]
+
+            if is_segment_start:
+                message = (
+                    f"🎉 NEW SEGMENT STARTED!\n\n"
+                    f"📅 Segment {segment_info['segment']} (Days {segment_info['start_date'].day}-{segment_info['end_date'].day})\n"
+                    f"💰 Today's Budget: ${new_daily_budget:.2f}\n"
+                    f"📆 Date: {today.strftime('%Y-%m-%d')}\n\n"
+                    f"💡 Remember to set your budget with /setbudget if needed!"
+                )
+            else:
+                # Show budget adjustment info
+                if new_daily_budget < Decimal(budget['budget_per_day']):
+                    message = (
+                        f"🌅 Good morning!\n\n"
+                        f"💰 Today's Budget: ${new_daily_budget:.2f}\n"
+                        f"⚠️ Adjusted down from ${budget['budget_per_day']:.2f} due to overspending\n"
+                        f"📅 Date: {today.strftime('%Y-%m-%d')}"
+                    )
+                elif new_daily_budget > Decimal(budget['budget_per_day']):
+                    message = (
+                        f"🌅 Good morning!\n\n"
+                        f"💰 Today's Budget: ${new_daily_budget:.2f}\n"
+                        f"✅ Adjusted up from ${budget['budget_per_day']:.2f} - you're doing great!\n"
+                        f"📅 Date: {today.strftime('%Y-%m-%d')}"
+                    )
+                else:
+                    message = (
+                        f"🌅 Good morning!\n\n"
+                        f"💰 Today's Budget: ${new_daily_budget:.2f}\n"
+                        f"📅 Date: {today.strftime('%Y-%m-%d')}"
+                    )
+
+            outgoing.append((user['telegram_id'], message))
+        except Exception as e:
+            logger.error(f"Error preparing notification for user {user['id']}: {e}")
+
+    return outgoing
+
+
 async def send_daily_notification(context: ContextTypes.DEFAULT_TYPE):
     """Send daily notifications to all users at 9 AM and adjust budgets"""
-    conn = DatabaseManager.get_connection()
-    try:
-        with conn.cursor(cursor_factory=RealDictCursor) as cur:
-            cur.execute("SELECT * FROM users")
-            users = cur.fetchall()
-            
-            today = get_current_date()
-            yesterday = today - timedelta(days=1)
-            
-            for user in users:
-                try:
-                    # Get budget info
-                    budget = DatabaseManager.get_budget(user['id'])
-                    if not budget:
-                        continue
-                    
-                    # Calculate what the adjusted daily should be for today
-                    segment = BudgetCalculator.calculate_segment_summary(user['id'])
-                    if not segment:
-                        continue
-                    
-                    # Get yesterday's spending
-                    spent_yesterday = DatabaseManager.get_total_spent(user['id'], yesterday, yesterday)
-                    
-                    # Determine today's budget based on yesterday's performance
-                    yesterday_budget = budget.get('adjusted_daily') or budget['budget_per_day']
-                    
-                    # If overspent yesterday or underspent yesterday, adjust for today
-                    days_remaining = segment['days_remaining']
-                    if days_remaining > 0:
-                        # Calculate new daily budget based on remaining segment budget
-                        new_daily_budget = segment['remaining_segment'] / days_remaining
-                        
-                        # Update the adjusted daily for today
-                        DatabaseManager.update_adjusted_daily(user['id'], new_daily_budget, today)
-                        
-                        segment_info = BudgetCalculator.get_segment_info(today)
-                        
-                        # Check if it's the first day of a new segment
-                        is_segment_start = today.day in [1, 11, 21]
-                        
-                        if is_segment_start:
-                            message = (
-                                f"🎉 NEW SEGMENT STARTED!\n\n"
-                                f"📅 Segment {segment_info['segment']} (Days {segment_info['start_date'].day}-{segment_info['end_date'].day})\n"
-                                f"💰 Today's Budget: ${new_daily_budget:.2f}\n"
-                                f"📆 Date: {today.strftime('%Y-%m-%d')}\n\n"
-                                f"💡 Remember to set your budget with /setbudget if needed!"
-                            )
-                        else:
-                            # Show budget adjustment info
-                            if new_daily_budget < Decimal(budget['budget_per_day']):
-                                message = (
-                                    f"🌅 Good morning!\n\n"
-                                    f"💰 Today's Budget: ${new_daily_budget:.2f}\n"
-                                    f"⚠️ Adjusted down from ${budget['budget_per_day']:.2f} due to overspending\n"
-                                    f"📅 Date: {today.strftime('%Y-%m-%d')}"
-                                )
-                            elif new_daily_budget > Decimal(budget['budget_per_day']):
-                                message = (
-                                    f"🌅 Good morning!\n\n"
-                                    f"💰 Today's Budget: ${new_daily_budget:.2f}\n"
-                                    f"✅ Adjusted up from ${budget['budget_per_day']:.2f} - you're doing great!\n"
-                                    f"📅 Date: {today.strftime('%Y-%m-%d')}"
-                                )
-                            else:
-                                message = (
-                                    f"🌅 Good morning!\n\n"
-                                    f"💰 Today's Budget: ${new_daily_budget:.2f}\n"
-                                    f"📅 Date: {today.strftime('%Y-%m-%d')}"
-                                )
-                        
-                        await context.bot.send_message(
-                            chat_id=user['telegram_id'],
-                            text=message
-                        )
-                except Exception as e:
-                    logger.error(f"Error sending notification to user {user['id']}: {e}")
-    finally:
-        DatabaseManager.release_connection(conn)
+    outgoing = await asyncio.to_thread(build_daily_notifications)
+
+    for telegram_id, message in outgoing:
+        try:
+            await context.bot.send_message(chat_id=telegram_id, text=message)
+        except Exception as e:
+            logger.error(f"Error sending notification to {telegram_id}: {e}")
+
+
+async def deliver_clock_reminder(bot, reminder_key, title, body):
+    """Claim a reminder for today and, if won, message every user.
+
+    Returns True if this call delivered the reminder. All database work goes
+    through asyncio.to_thread: psycopg2 is blocking, and a slow query on the event
+    loop would delay other jobs past the scheduler's misfire window.
+    """
+    claimed = await asyncio.to_thread(
+        DatabaseManager.claim_clock_reminder, reminder_key, get_current_date()
+    )
+    if not claimed:
+        return False
+
+    users = await asyncio.to_thread(DatabaseManager.get_all_telegram_ids)
+    now = get_current_time()
+    message = f"{title}\n\n{body}\n🕐 {now.strftime('%H:%M')} - {now.strftime('%A, %d %b %Y')}"
+
+    for user in users:
+        try:
+            await bot.send_message(chat_id=user['telegram_id'], text=message)
+        except Exception as e:
+            logger.error(f"Error sending clock reminder to {user['telegram_id']}: {e}")
+    return True
 
 
 async def send_clock_reminder(context: ContextTypes.DEFAULT_TYPE):
@@ -839,23 +937,35 @@ async def send_clock_reminder(context: ContextTypes.DEFAULT_TYPE):
     if get_current_time().weekday() >= 5:
         return
 
-    title, body = context.job.data
-    now = get_current_time()
-    message = f"{title}\n\n{body}\n🕐 {now.strftime('%H:%M')} - {now.strftime('%A, %d %b %Y')}"
+    reminder_key, title, body = context.job.data
+    await deliver_clock_reminder(context.bot, reminder_key, title, body)
 
-    conn = DatabaseManager.get_connection()
-    try:
-        with conn.cursor(cursor_factory=RealDictCursor) as cur:
-            cur.execute("SELECT telegram_id FROM users")
-            users = cur.fetchall()
-    finally:
-        DatabaseManager.release_connection(conn)
 
-    for user in users:
-        try:
-            await context.bot.send_message(chat_id=user['telegram_id'], text=message)
-        except Exception as e:
-            logger.error(f"Error sending clock reminder to {user['telegram_id']}: {e}")
+async def catch_up_clock_reminders(context: ContextTypes.DEFAULT_TYPE):
+    """Deliver any weekday reminder that came due while the bot was not running.
+
+    The job queue lives in memory, so a restart schedules only future runs and
+    anything missed during downtime is lost. This runs once at startup to recover
+    those; the database claim keeps it from duplicating what already went out.
+    """
+    now = datetime.now(SCHEDULE_TZ)
+    if now.weekday() >= 5:
+        return
+
+    for reminder_time, title, body in CLOCK_REMINDERS:
+        due_at = now.replace(
+            hour=reminder_time.hour, minute=reminder_time.minute,
+            second=0, microsecond=0
+        )
+        lateness = now - due_at
+        if not timedelta(0) <= lateness <= CATCH_UP_WINDOW:
+            continue
+
+        reminder_key = reminder_time.strftime('%H%M')
+        if await deliver_clock_reminder(context.bot, reminder_key, title, body):
+            logger.warning(
+                f"Catch-up: delivered missed {reminder_key} reminder, {lateness} late"
+            )
 
 
 def run_flask():
@@ -896,13 +1006,24 @@ def main():
 
     # Schedule weekday clock in/out reminders
     for reminder_time, title, body in CLOCK_REMINDERS:
+        reminder_key = reminder_time.strftime('%H%M')
         job_queue.run_daily(
             send_clock_reminder,
             time=reminder_time.replace(tzinfo=SCHEDULE_TZ),
-            data=(title, body),
-            name=f"clock_reminder_{reminder_time.strftime('%H%M')}"
+            data=(reminder_key, title, body),
+            name=f"clock_reminder_{reminder_key}",
+            job_kwargs={"misfire_grace_time": REMINDER_MISFIRE_GRACE}
         )
         logger.info(f"Scheduled {title} reminder at {reminder_time.strftime('%H:%M')} (weekdays)")
+
+    # Recover reminders missed while the bot was down. Delayed slightly so the bot
+    # is fully initialised before it tries to send anything.
+    job_queue.run_once(
+        catch_up_clock_reminders,
+        when=timedelta(seconds=15),
+        name="clock_reminder_catch_up",
+        job_kwargs={"misfire_grace_time": REMINDER_MISFIRE_GRACE}
+    )
 
     # Start bot
     logger.info("Bot starting...")
